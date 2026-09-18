@@ -156,10 +156,12 @@ class AuctionManager:
 
         name = str(getattr(player, "name", "") or "")
         now = int(time.time())
+        # 防狙击延时：剩余不足 5 分钟时，每有一次新出价，截止时间顺延 1 分钟
+        extend_seconds = 60 if int(auction.get("end_time") or 0) - now < 300 else 0
         if not self.plugin.db.execute(
-            "UPDATE auctions SET current_price=?, current_bidder_xuid=?, current_bidder_name=? "
-            "WHERE id=? AND status='active' AND end_time>?",
-            (amount, xuid, name, int(auction_id), now),
+            "UPDATE auctions SET current_price=?, current_bidder_xuid=?, current_bidder_name=?, "
+            "end_time=end_time+? WHERE id=? AND status='active' AND end_time>?",
+            (amount, xuid, name, extend_seconds, int(auction_id), now),
         ):
             return False, "出价失败，请稍后再试"
 
@@ -174,9 +176,11 @@ class AuctionManager:
         })
         prev = self.plugin.player_by_xuid(str(auction.get("current_bidder_xuid") or ""))
         if prev is not None:
+            extra = "，剩余不足5分钟，拍卖已延时1分钟" if extend_seconds else ""
             self.plugin.toast(
                 prev, "竞拍提醒",
-                f"你在「{self.item_display(json.loads(auction['item_data']))}」的拍卖中被 {name} 超过（{amount:.2f} 元）")
+                f"你在「{self.item_display(json.loads(auction['item_data']))}」的拍卖中被 {name} 超过"
+                f"（{amount:.2f} 元）{extra}")
         return True, amount
 
     # ---------- 结算 ----------
@@ -203,10 +207,11 @@ class AuctionManager:
 
         winner_xuid = auction.get("current_bidder_xuid")
         if not winner_xuid:
-            # 流拍：退托管物品
+            # 流拍：退托管物品（背包有空位直退，否则走永不过期邮件）
             self._finish(auction_id, STATUS_SETTLED, "流拍")
-            self._deliver(auction.get("seller_xuid"), auction.get("seller_name"), item_info)
-            self.plugin.broadcast(f"[弧光商城] 拍卖流拍：{label}（无人出价），物品已退还 {auction.get('seller_name')}")
+            self._deliver_return(auction.get("seller_xuid"), auction.get("seller_name"),
+                                 item_info, "拍卖流拍（无人出价）")
+            self.plugin.broadcast(f"[弧光商城] 拍卖流拍：{label}（无人出价），物品已退还 {auction.get('seller_name')}（背包或邮箱）")
             return
 
         price = self._round_money(float(auction.get("current_price") or 0))
@@ -217,7 +222,8 @@ class AuctionManager:
         if core is None:
             # 无经济插件兜底：不能凭空成交，按流拍处理并退物品给卖家
             self._finish(auction_id, STATUS_SETTLED, "结算失败：弧光核心未加载")
-            self._deliver(auction.get("seller_xuid"), auction.get("seller_name"), item_info)
+            self._deliver_return(auction.get("seller_xuid"), auction.get("seller_name"),
+                                 item_info, "拍卖结算失败（弧光核心未加载）")
             self.plugin.logger.error(f"[ARCOnlineMall] 拍卖 #{auction_id} 结算时弧光核心缺失，已流拍退物")
             return
 
@@ -230,7 +236,8 @@ class AuctionManager:
         if not charged:
             # 扣款写库失败属异常情况：按流拍退物，避免赢家白得物品
             self._finish(auction_id, STATUS_SETTLED, "结算失败：扣款异常")
-            self._deliver(auction.get("seller_xuid"), auction.get("seller_name"), item_info)
+            self._deliver_return(auction.get("seller_xuid"), auction.get("seller_name"),
+                                 item_info, "拍卖结算失败（扣款异常）")
             self.plugin.broadcast(f"[弧光商城] 拍卖结算异常：{label} 已流拍，物品退还卖家")
             return
 
@@ -247,7 +254,7 @@ class AuctionManager:
             pass
 
         self._finish(auction_id, STATUS_SETTLED, f"成交价 {price:.2f}")
-        self._deliver(winner_xuid, winner_name, item_info)
+        self._deliver_won(winner_xuid, winner_name, item_info, price)
         msg = f"[弧光商城] 拍卖成交：{winner_name} 以 {price:.2f} 元拍得 {label}！"
         if debt > 0:
             msg += f"（余额不足，已欠银行 {debt:.2f} 元）"
@@ -269,8 +276,9 @@ class AuctionManager:
             return False, "已有玩家出价，拍卖不可取消"
         self._finish(int(auction_id), STATUS_CANCELLED, "卖家取消")
         item_info = json.loads(auction.get("item_data") or "{}")
-        self._deliver(auction.get("seller_xuid"), auction.get("seller_name"), item_info)
-        return True, "拍卖已取消，托管物品已退还"
+        self._deliver_return(auction.get("seller_xuid"), auction.get("seller_name"),
+                             item_info, "卖家取消拍卖")
+        return True, "拍卖已取消，托管物品已退还（背包或邮箱）"
 
     def get_auction(self, auction_id: int) -> dict | None:
         row = self.plugin.db.query_one("SELECT * FROM auctions WHERE id=?", (int(auction_id),))
@@ -288,6 +296,91 @@ class AuctionManager:
         return [dict(r) for r in rows]
 
     # ---------- 发货与离线补发 ----------
+
+    def _deliver_return(self, xuid, name, item_info: dict, reason: str) -> None:
+        """退回路径（流拍/取消/结算异常）：
+
+        在线且背包有空位 → 直接退背包；否则走 arc_core 邮件（附件含完整 NBT，永不过期）；
+        邮件系统不可用时回落到旧的补发队列。
+        """
+        xuid = str(xuid or "")
+        name = str(name or "")
+        if not xuid:
+            self.plugin.logger.error(
+                f"[ARCOnlineMall] 退回失败：无 xuid，详情={json.dumps(item_info, ensure_ascii=False)}")
+            return
+        player = self.plugin.player_by_xuid(xuid)
+        if player is not None and self._has_empty_slot(player):
+            self._give(player, item_info)
+            return
+        if self._mail_return(xuid, name, item_info, reason):
+            if player is not None:
+                self.plugin.toast(player, "背包已满",
+                                  f"退回物品已转入邮箱（30 天内领取），请到邮箱查收")
+            return
+        self.plugin.db.insert("pending_deliveries", {
+            "xuid": xuid,
+            "player_name": name,
+            "item_data": json.dumps(item_info, ensure_ascii=False),
+            "quantity": int(item_info.get("count") or 1),
+            "created_time": int(time.time()),
+        })
+        self.plugin.logger.info(f"[ARCOnlineMall] {name or xuid} 退回物品进入补发队列（邮件系统不可用）")
+
+    def _has_empty_slot(self, player) -> bool:
+        """主背包 36 格里是否还有空位（拿不到背包信息时按有空间处理，走原直发路径）。"""
+        inv = self.plugin.inventory_plugin()
+        if inv is None:
+            return True
+        try:
+            items = inv.api_get_inventory_items(player) or []
+        except Exception:
+            return True
+        used = sum(1 for it in items
+                   if isinstance(it, dict) and isinstance(it.get("slot_index"), int))
+        return used < 36
+
+    def _mail_item(self, xuid, name, item_info: dict, title: str, content: str,
+                   expire_days: float | None = None) -> bool:
+        """经 arc_core 邮件发放物品（富物品条目，含 NBT）。expire_days=None 走默认 30 天。"""
+        core = self.plugin.core_plugin()
+        fn = getattr(core, "api_send_mail", None) if core is not None else None
+        if not callable(fn):
+            return False
+        try:
+            ok = bool(fn(
+                title=title, content=content,
+                player_name=name, xuid=xuid,
+                items=[dict(item_info)], sender_name="弧光商城",
+                expire_days=expire_days,
+            ))
+        except Exception as e:
+            self.plugin.logger.warning(f"[ARCOnlineMall] 邮件发放异常: {e}")
+            return False
+        if ok:
+            self.plugin.logger.info(f"[ARCOnlineMall] 已向 {name or xuid} 发放邮件：{title}")
+        return ok
+
+    def _mail_return(self, xuid, name, item_info: dict, reason: str) -> bool:
+        display = self.item_display(item_info)
+        count = int(item_info.get("count") or 1)
+        return self._mail_item(
+            xuid, name, item_info,
+            title=f"拍卖退回：{display} ×{count}",
+            content=f"{reason}，退回物品已存入本邮件附件（含完整 NBT），"
+                    f"请于 30 天内领取，过期未领将作废。",
+        )
+
+    def _deliver_won(self, xuid, name, item_info: dict, price: float) -> None:
+        """赢家收货：优先走邮件（默认 30 天有效期）；邮件不可用回落直发/补发队列。"""
+        xuid = str(xuid or "")
+        if xuid and self._mail_item(
+                xuid, name, item_info,
+                title=f"拍卖成交：{self.item_display(item_info)} ×{int(item_info.get('count') or 1)}",
+                content=f"恭喜以 {price:.2f} 元拍得，货款已结算。"
+                        f"请于 30 天内领取附件，过期未领将作废。"):
+            return
+        self._deliver(xuid, name, item_info)
 
     def _deliver(self, xuid, name, item_info: dict) -> None:
         """在线直接发货；离线进补发队列，PlayerJoinEvent 时补发。"""

@@ -38,15 +38,17 @@ class MallMenus:
     # ---------- 商品列表 ----------
 
     def show_search(self, player) -> None:
-        hint = Label(text="输入物品名称关键字（留空显示全部）")
-        inp = TextInput(label="关键字", placeholder="例如：钻石", default_value="")
+        hint = Label(text="输入物品名称关键字（支持模糊搜索，留空显示全部）")
+        inp = TextInput(label="关键字", placeholder="例如：石、钻石、shulker", default_value="")
 
         def _submit(p, json_str: str) -> None:
             try:
                 data = json.loads(json_str)
             except Exception:
                 return
-            keyword = str(data[0] if isinstance(data, list) else data or "").strip()
+            # ModalForm 返回数组中 Label 提示控件占第 0 位（null），输入值从下标 1 开始
+            keyword = str(data[1] if isinstance(data, list) and len(data) > 1
+                          else (data if not isinstance(data, list) else "") or "").strip()
             self.show_shop_list(p, 0, keyword)
 
         player.send_form(ModalForm(title="搜索商品", controls=[hint, inp], on_submit=_submit))
@@ -56,7 +58,8 @@ class MallMenus:
         if keyword:
             kw = keyword.lower()
             shops = [s for s in shops if kw in str(s.get("item_type") or "").lower()
-                     or kw in str((s.get("item_info") or {}).get("name") or "").lower()]
+                     or kw in str((s.get("item_info") or {}).get("name") or "").lower()
+                     or kw in str(s.get("owner_name") or "").lower()]
         if not shops:
             form = ActionForm(title="网上商城", content="暂无可网购的商品。\n\n可能是商店插件未加载或没有出售向商店。")
             form.add_button("返回", on_click=lambda p: self.open_mall_main(p))
@@ -132,7 +135,9 @@ class MallMenus:
         def _submit(p, json_str: str) -> None:
             try:
                 data = json.loads(json_str)
-                qty = int(str(data[0] if isinstance(data, list) else data or "").strip())
+                # ModalForm 返回数组中 Label 提示控件占第 0 位（null），输入值从下标 1 开始
+                qty = int(str(data[1] if isinstance(data, list) and len(data) > 1
+                              else (data if not isinstance(data, list) else "") or "").strip())
             except Exception:
                 self.toast(p, "购买失败", "数量格式不正确")
                 return

@@ -8,7 +8,7 @@
 
 import json
 
-from endstone.form import ActionForm, Dropdown, Label, ModalForm, TextInput, MessageForm
+from endstone.form import ActionForm, Dropdown, Label, ModalForm, Slider, TextInput, MessageForm
 
 from . import config
 from .auction_manager import STATUS_ACTIVE
@@ -31,6 +31,7 @@ class AuctionMenus:
             content=f"正在进行中的拍卖：{len(active)} 场\n\n拍卖截止时按最高价强制扣款，\n余额不足将扣成负数（欠银行），出价请量力而行！",
         )
         form.add_button("浏览拍卖", on_click=lambda p: self.show_auction_list(p, 0))
+        form.add_button("搜索拍卖", on_click=lambda p: self.show_auction_search(p))
         form.add_button("发起拍卖", on_click=lambda p: self.show_inventory_pick(p))
         form.add_button("我的拍卖", on_click=lambda p: self.show_my_auctions(p))
         form.add_button("返回商城", on_click=lambda p: self.open_mall_main(p))
@@ -38,10 +39,48 @@ class AuctionMenus:
 
     # ---------- 浏览与出价 ----------
 
-    def show_auction_list(self, player, page: int = 0) -> None:
+    def _auction_matches(self, auction: dict, keyword: str) -> bool:
+        """模糊匹配：关键字包含在拍品显示名、物品 ID 或卖家名里即命中（不区分大小写）。
+
+        例：搜「石」可命中 圆石/石砖/磨制石砖；搜「diamond」可命中 minecraft:diamond。
+        """
+        kw = str(keyword or "").strip().lower()
+        if not kw:
+            return True
+        item_info = self._item_info(auction)
+        hay = " ".join((
+            self.auction.item_display(item_info),
+            str(auction.get("item_type") or ""),
+            str(auction.get("seller_name") or ""),
+        )).lower()
+        return kw in hay
+
+    def show_auction_search(self, player) -> None:
+        hint = Label(text="输入拍品名称关键字（支持模糊搜索，如：石、钻石、shulker）")
+        inp = TextInput(label="关键字", placeholder="例如：石", default_value="")
+
+        def _submit(p, json_str: str) -> None:
+            try:
+                data = json.loads(json_str)
+            except Exception:
+                return
+            # ModalForm 返回数组中 Label 提示控件占第 0 位（null），输入值从下标 1 开始
+            keyword = str(data[1] if isinstance(data, list) and len(data) > 1
+                          else (data if not isinstance(data, list) else "") or "").strip()
+            self.show_auction_list(p, 0, keyword)
+
+        player.send_form(ModalForm(title="搜索拍卖", controls=[hint, inp], on_submit=_submit))
+
+    def show_auction_list(self, player, page: int = 0, keyword: str = "") -> None:
         auctions = self.auction.list_active()
+        if keyword:
+            auctions = [a for a in auctions if self._auction_matches(a, keyword)]
         if not auctions:
-            form = ActionForm(title="拍卖行", content="当前没有进行中的拍卖。\n快输入 /om 发起第一场吧！")
+            empty_msg = (f"没有匹配「{keyword}」的拍卖。"
+                         if keyword else "当前没有进行中的拍卖。\n快输入 /om 发起第一场吧！")
+            form = ActionForm(title="拍卖行", content=empty_msg)
+            form.add_button("重新搜索", on_click=lambda p: self.show_auction_search(p))
+            form.add_button("浏览全部", on_click=lambda p: self.show_auction_list(p, 0))
             form.add_button("返回", on_click=lambda p: self.open_auction_main(p))
             player.send_form(form)
             return
@@ -49,8 +88,8 @@ class AuctionMenus:
         page_size = config.PAGE_SIZE
         total_pages = (len(auctions) + page_size - 1) // page_size
         page = max(0, min(page, total_pages - 1))
-        form = ActionForm(title=f"拍卖列表 {page + 1}/{total_pages}",
-                          content=f"共 {len(auctions)} 场拍卖进行中")
+        head = f"共 {len(auctions)} 场拍卖进行中" + (f"（关键字：{keyword}）" if keyword else "")
+        form = ActionForm(title=f"拍卖列表 {page + 1}/{total_pages}", content=head)
         for a in auctions[page * page_size:(page + 1) * page_size]:
             item_info = self._item_info(a)
             price = a.get("current_price")
@@ -61,10 +100,11 @@ class AuctionMenus:
                 on_click=lambda p, aid=a["id"]: self.show_auction_detail(p, aid),
             )
         if page > 0:
-            form.add_button("上一页", on_click=lambda p: self.show_auction_list(p, page - 1))
+            form.add_button("上一页", on_click=lambda p: self.show_auction_list(p, page - 1, keyword))
         if page < total_pages - 1:
-            form.add_button("下一页", on_click=lambda p: self.show_auction_list(p, page + 1))
-        form.add_button("刷新", on_click=lambda p: self.show_auction_list(p, page))
+            form.add_button("下一页", on_click=lambda p: self.show_auction_list(p, page + 1, keyword))
+        form.add_button("刷新", on_click=lambda p: self.show_auction_list(p, page, keyword))
+        form.add_button("重新搜索", on_click=lambda p: self.show_auction_search(p))
         form.add_button("返回", on_click=lambda p: self.open_auction_main(p))
         player.send_form(form)
 
@@ -96,10 +136,13 @@ class AuctionMenus:
             "截止后按最高价强制扣款，可扣成负数（欠银行）！",
         ]
         form = ActionForm(title="拍卖详情", content="\n".join(lines))
-        form.add_button("我要出价", on_click=lambda p: self.show_bid_form(p, auction_id))
-        if self.xuid_of(player) == a.get("seller_xuid") and not has_bid:
-            form.add_button("取消拍卖", on_click=lambda p: self._do_cancel(p, auction_id))
         form.add_button("刷新", on_click=lambda p: self.show_auction_detail(p, auction_id))
+        # 卖家不能竞拍自己发起的拍卖：直接不给出价入口（place_bid 服务端仍保留拦截兜底）
+        is_seller = self.xuid_of(player) == a.get("seller_xuid")
+        if not is_seller:
+            form.add_button("我要出价", on_click=lambda p: self.show_bid_form(p, auction_id))
+        if is_seller and not has_bid:
+            form.add_button("取消拍卖", on_click=lambda p: self._do_cancel(p, auction_id))
         form.add_button("返回列表", on_click=lambda p: self.show_auction_list(p, 0))
         player.send_form(form)
 
@@ -195,25 +238,30 @@ class AuctionMenus:
         choices = [self.auction.duration_text(m) for m in config.AUCTION_DURATION_CHOICES]
         default_increment = self.setting_float("AUCTION_DEFAULT_INCREMENT", config.AUCTION_DEFAULT_INCREMENT)
         min_start = self.setting_float("AUCTION_MIN_START_PRICE", config.AUCTION_MIN_START_PRICE)
+        max_qty = max(1, int(item_info.get("count") or 1))
         hint = Label(text=(
-            f"拍品：{self.auction.item_display(item_info)} ×{item_info.get('count')}\n"
+            f"拍品：{self.auction.item_display(item_info)}（持有 {max_qty} 件）\n"
             f"确认后物品立即托管，流拍或取消时退还\n起拍价不低于 {min_start:.2f} 元"))
         start_inp = TextInput(label="起拍价（元）", placeholder=f"不低于 {min_start:g}", default_value="100")
         incr_inp = TextInput(label="每次最低加价（元）", placeholder="例如 1000",
                              default_value=f"{default_increment:g}")
         dur_drop = Dropdown(label="拍卖时长", options=choices, default_index=0)
+        qty_slider = Slider(label="上架数量（件）", min=1, max=max_qty, step=1,
+                            default_value=max_qty)
 
         def _submit(p, json_str: str) -> None:
             try:
                 data = json.loads(json_str)
-                start_price = float(str(data[0]).strip())
-                increment = float(str(data[1]).strip())
-                duration = config.AUCTION_DURATION_CHOICES[int(data[2])]
+                # ModalForm 返回数组中 Label 提示控件占第 0 位（null），输入值从下标 1 开始
+                start_price = float(str(data[1]).strip())
+                increment = float(str(data[2]).strip())
+                duration = config.AUCTION_DURATION_CHOICES[int(data[3])]
+                quantity = min(max_qty, max(1, int(float(data[4]))))
             except Exception:
                 self.toast(p, "发起失败", "价格或时长格式不正确")
                 return
             confirm = (
-                f"拍品：{self.auction.item_display(item_info)} ×{item_info.get('count')}\n"
+                f"拍品：{self.auction.item_display(item_info)} ×{quantity}\n"
                 f"起拍价：{start_price:.2f} 元｜每次最低加价：{increment:.2f} 元\n"
                 f"时长：{self.auction.duration_text(duration)}\n\n"
                 f"确认后物品立即从背包托管，发起后全服播报！"
@@ -221,7 +269,7 @@ class AuctionMenus:
 
             def _go() -> None:
                 ok, msg = self.auction.create_auction(
-                    p, item_info, int(item_info.get("count") or 1),
+                    p, item_info, quantity,
                     start_price, increment, duration)
                 if ok:
                     self.toast(p, "拍卖已发起", "全服播报已发送，祝你拍出好价钱")
@@ -232,7 +280,8 @@ class AuctionMenus:
                                     button1="确认发起", button2="再想想",
                                     on_submit=lambda s, choice: _go() if int(choice) == 0 else None))
 
-        player.send_form(ModalForm(title="发起拍卖", controls=[hint, start_inp, incr_inp, dur_drop],
+        player.send_form(ModalForm(title="发起拍卖",
+                                   controls=[hint, start_inp, incr_inp, dur_drop, qty_slider],
                                    on_submit=_submit))
 
     # ---------- 我的拍卖 ----------

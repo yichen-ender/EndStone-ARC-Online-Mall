@@ -160,6 +160,15 @@ class Toggle:
         self.default_value = default_value
 
 
+class Slider:
+    def __init__(self, label="", min=0, max=100, step=20, default_value=None):
+        self.label = label
+        self.min = min
+        self.max = max
+        self.step = step
+        self.default_value = default_value if default_value is not None else min
+
+
 form_mod.ActionForm = ActionForm
 form_mod.MessageForm = MessageForm
 form_mod.ModalForm = ModalForm
@@ -167,6 +176,7 @@ form_mod.Dropdown = Dropdown
 form_mod.Label = Label
 form_mod.TextInput = TextInput
 form_mod.Toggle = Toggle
+form_mod.Slider = Slider
 
 inv_mod = _mod("endstone.inventory")
 
